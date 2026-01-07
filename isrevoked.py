@@ -1,4 +1,9 @@
 #!/usr/bin/python3
+#
+# SPDX-License-Identifier: 0BSD
+# (c) Hanno Böck
+#
+# Part of [badkeys](https://badkeys.info/)
 
 import argparse
 import datetime
