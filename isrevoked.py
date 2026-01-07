@@ -10,9 +10,12 @@ import datetime
 import functools
 import os
 import pathlib
+import sys
 import urllib.request
 
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509 import ocsp
 from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
 
 
@@ -26,6 +29,60 @@ def _cachedir():
     if not os.path.isdir(cachedir):
         os.mkdir(cachedir)
     return cachedir
+
+
+def _warn(msg):
+    # prevent control character injection
+    fmsg = repr(msg)[1:-1]
+    sys.stdout.write(f"WARNING: {fmsg}\n")
+
+
+def _getfromcache(cachetype, url):
+    if cachetype not in ["crl", "issuer"]:
+        exmsg = "cachetype must be 'crl' or 'issuer'"
+        raise ValueError(exmsg)
+
+    cachefn = url.split("//")[-1].replace("/", "_")
+    cachep = os.path.join(_cachedir(), cachetype)
+    cachefp = os.path.join(cachep, cachefn)
+
+    havecache = False
+    if os.path.isfile(cachefp):
+        havecache = True
+        if cachetype == "crl":
+            cachetime = int(os.path.getmtime(cachefp))
+            now = datetime.datetime.now(tz=datetime.UTC)
+            # always remove cached CRL files older than 10 days
+            if (int(now.timestamp()) - cachetime) > 10 * 24 * 60 * 60:
+                os.remove(cachefp)
+                havecache = False
+
+    if havecache:
+        raw = pathlib.Path(cachefp).read_bytes()
+        if cachetype == "crl":
+            crl = x509.load_der_x509_crl(raw)
+            if crl.next_update_utc < now:
+                os.remove(cachefp)
+                havecache = False
+            else:
+                return crl
+
+    if not havecache:
+        with urllib.request.urlopen(url) as u:
+            raw = u.read()
+            mimetype = u.headers.get_content_type()
+        if cachetype == "issuer" and mimetype != "application/pkix-cert":
+            print(f"WARNING: wrong content type {mimetype} for CA issuer")
+        elif cachetype == "crl" and mimetype != "application/pkix-crl":
+            print(f"WARNING: wrong content type {mimetype} for CRL")
+
+        if not os.path.isdir(cachep):
+            os.mkdir(cachep)
+        pathlib.Path(cachefp).write_bytes(raw)
+
+    if cachetype == "crl":
+        return x509.load_der_x509_crl(raw)
+    return x509.load_der_x509_certificate(raw)
 
 
 def geturls(cert):
@@ -53,32 +110,34 @@ def geturls(cert):
 
 
 def checkcrl(cert, crlurl):
-    cachefn = crlurl.split("//")[-1].replace("/", "_")
-    cachefp = os.path.join(_cachedir(), cachefn)
-
-    crl = None
-    if os.path.isfile(cachefp):
-        cachetime = int(os.path.getmtime(cachefp))
-        now = datetime.datetime.now(tz=datetime.UTC)
-        # always remove cache files older than 10 days
-        if (int(now.timestamp()) - cachetime) > 10 * 24 * 60 * 60:
-            os.remove(cachefp)
-        crl_raw = pathlib.Path(cachefp).read_bytes()
-        crl = x509.load_der_x509_crl(crl_raw)
-
-        if crl.next_update_utc < now:
-            os.remove(cachefp)
-            crl = None
-
-    if not crl:
-        with urllib.request.urlopen(crlurl) as u:
-            crl_raw = u.read()
-            pathlib.Path(cachefp).write_bytes(crl_raw)
-        crl = x509.load_der_x509_crl(crl_raw)
+    crl = _getfromcache("crl", crlurl)
 
     if crl.get_revoked_certificate_by_serial_number(cert.serial_number):
         return "revoked"
     return "valid"
+
+
+def checkocsp(cert, ocsp_url, issuer_url):
+    issuer_cert = _getfromcache("issuer", issuer_url)
+
+    obuilder = ocsp.OCSPRequestBuilder()
+    obuilder = obuilder.add_certificate(cert, issuer_cert, hashes.SHA1())  # noqa: DUO134, S303
+    req = obuilder.build().public_bytes(serialization.Encoding.DER)
+
+    httpreq = urllib.request.Request(ocsp_url, data=req,
+                                     headers={"Content-Type": "application/ocsp-request"})
+
+    with urllib.request.urlopen(httpreq) as ocsphttp:
+        ocspresp_raw = ocsphttp.read()
+
+    ocsp_response = ocsp.load_der_ocsp_response(ocspresp_raw)
+
+    if ocsp_response.certificate_status == ocsp.OCSPCertStatus.GOOD:
+        return "valid"
+    if ocsp_response.certificate_status == ocsp.OCSPCertStatus.REVOKED:
+        return "revoked"
+
+    return "error"
 
 
 def isrevoked(pem):
@@ -87,10 +146,13 @@ def isrevoked(pem):
     if cert.not_valid_after_utc < datetime.datetime.now(tz=datetime.UTC):
         return "expired"
 
-    _, _, crl = geturls(cert)
+    issuer, ocsp, crl = geturls(cert)
 
     if crl:
         return checkcrl(cert, crl)
+
+    if ocsp:
+        return checkocsp(cert, ocsp, issuer)
 
     return "unknown"
 
