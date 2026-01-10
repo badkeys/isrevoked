@@ -72,9 +72,9 @@ def _getfromcache(cachetype, url):
             raw = u.read()
             mimetype = u.headers.get_content_type()
         if cachetype == "issuer" and mimetype != "application/pkix-cert":
-            print(f"WARNING: wrong content type {mimetype} for CA issuer")
+            _warn(f"Wrong content type {mimetype} for CA issuer")
         elif cachetype == "crl" and mimetype != "application/pkix-crl":
-            print(f"WARNING: wrong content type {mimetype} for CRL")
+            _warn(f"Wrong content type {mimetype} for CRL")
 
         if not os.path.isdir(cachep):
             os.mkdir(cachep)
@@ -129,6 +129,9 @@ def checkocsp(cert, ocsp_url, issuer_url):
 
     with urllib.request.urlopen(httpreq) as ocsphttp:
         ocspresp_raw = ocsphttp.read()
+        mimetype = ocsphttp.headers.get_content_type()
+    if mimetype != "application/ocsp-response":
+        _warn(f"Wrong content type {mimetype} for OCSP Response")
 
     ocsp_response = ocsp.load_der_ocsp_response(ocspresp_raw)
 
